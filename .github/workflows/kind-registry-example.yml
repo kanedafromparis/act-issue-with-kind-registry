@@ -1,0 +1,72 @@
+name: Sample integration test
+on:
+   push:
+      branches:
+      - "*"
+jobs: 
+    kind_integration_test:
+       runs-on: ubuntu-latest
+       steps:
+        - name: Checkout
+          uses: actions/checkout@v2
+  
+        - name: daemon.json hack
+          # link to https://github.com/container-tools/kind-action/blob/main/registry.sh#L133
+          if: ${{ env.ACT }}
+          run: |
+            mkdir -p /etc/docker
+            echo -n "{\"exec-opts\": [\"native.cgroupdriver=systemd\"],\"log-driver\": \"json-file\",\"log-opts\": {\"max-size\": \"100m\"},\"storage-driver\": \"overlay2\"}" > /etc/docker/daemon.json
+
+        - name: Create Kubernetes KinD Cluster (ACT)
+          uses: container-tools/kind-action@v1.5.0
+          with:
+            cluster_name: tomcat-local-apply
+            registry: true
+    
+        - name: Set up Java and Maven
+          uses: actions/setup-java@v2
+          with:
+            # java-version: ${{ matrix.java }}
+            java-version: 15
+            distribution: adopt-hotspot
+
+        - name: cache
+          uses: actions/cache@v2
+          if: ${{ !env.ACT }}
+          with:
+            path: ~/.m2/repository
+            key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+            restore-keys: |
+              ${{ runner.os }}-maven-
+
+        - name: Set up Maven for local ACT
+          uses: stCarolas/setup-maven@v4
+          if: ${{ env.ACT }}
+          with:
+            maven-version: 3.8.1
+
+        - name: create namespace sample-test
+          run: kubectl create ns sample-test
+
+        - name: build jib
+          run: |
+            if [[ -n $KIND_REGISTRY ]]; then
+              mvn -B package jib:build k8s:resource k8s:apply -Djib.allowInsecureRegistries=true -Djkube.namespace=sample-test -Djib-maven-image=$KIND_REGISTRY/kanedafromparis/\${project.artifactId}:\${project.version};
+            else
+              mvn -B package jib:dockerBuild k8s:resource k8s:apply -Djkube.namespace=sample-test;
+            fi
+
+        - name: check deployment
+          run: cat target/classes/META-INF/jkube/kubernetes.yml | tee -a debug.log
+
+        - name: check pod correctly started
+          run: |
+            LOOP=0 &&\
+            while [[ $(kubectl get pods -n sample-test -l app=sample -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}') != "True True True" ]]; do \
+              echo "waiting for pod" &&\
+              kubectl logs -n sample-test -l app=sample || echo "overide" &&\
+              (( LOOP++ )) &&\
+              if [[ $LOOP -gt 5 ]]; then exit 1; fi;\
+              echo "loop number $LOOP" &&\
+              sleep 10; \
+            done
